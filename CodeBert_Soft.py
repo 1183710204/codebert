@@ -1,18 +1,11 @@
 import json
-import random
-
 from torch import nn
 from tqdm import tqdm
 from transformers import AutoModelForMaskedLM, AutoTokenizer, get_scheduler
-from transformers import BertForMaskedLM, RobertaTokenizer, T5ForConditionalGeneration
 import torch
-import os
-import math
 from early_stopping import EarlyStopping
-from slices2vec import load_pickle
 
 data_dir = 'C:\\Users\\wkr\\Desktop\\dong\\real'
-# model_dir = 'C:\\Users\\wkr\\Desktop\\dong\\model\\23-10-08-prompt.pt'
 save_dir = 'D:\\dong\\model\\codebert_nodetype.pt'
 train_dir = 'D:/dong/data/vul_train.json'
 eval_dir = 'D:/dong/data/small_eval.json'
@@ -41,20 +34,13 @@ class PROMPTEmbedding(nn.Module):
 
 device = torch.device("cuda")
 torch.cuda.empty_cache()
-model = AutoModelForMaskedLM.from_pretrained('D://dong//codebert-base').to(device)
-# model = torch.load(save_dir).to(device)
 tokenizer = AutoTokenizer.from_pretrained('D://dong//codebert-base')
 yes_token_id = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('bad'))[0]
 no_token_id = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('good'))[0]
-
-# MAX_LENGTH = 500
-# WORD_NUM = 20
 seq_len = 50
 token_num = 25
 batch_size = 8
 n_tokens = 10
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.00001)
-token_linear = nn.Linear(token_num, 1).to(device)
 # prompt_emb = PROMPTEmbedding(model.get_input_embeddings(),
 #                              n_tokens=n_tokens,
 #                              initialize_from_vocab=True)
@@ -71,6 +57,36 @@ token_linear = nn.Linear(token_num, 1).to(device)
 #     if param.requires_grad:
 #         print(name, param.size())
 
+
+class BertModel(nn.Module):
+    def __init__(self):
+        super(BertModel, self).__init__()
+        self.model = AutoModelForMaskedLM.from_pretrained('D://dong//codebert-base').to(device)
+        # self.model = torch.load(save_dir).to(device)
+        self.dense = nn.Linear(token_num, 1).to(device)
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        seq_emb = torch.zeros((seq_len, batch_size, 768)).to(device)
+        for i in range(seq_len):
+            emb = self.model.base_model.embeddings(input_ids[i])
+            seq_emb[i] = self.dense(emb.transpose(2, 1)).squeeze(-1)
+            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
+        attention_mask = attention_mask.transpose(1, 0)
+        attention_mask, _ = torch.max(attention_mask, dim=-1)
+        if labels is not None:
+            outputs = self.model(inputs_embeds=seq_emb.transpose(1, 0), attention_mask=attention_mask,
+                                 labels=labels.long())
+        else:
+            outputs = self.model(inputs_embeds=seq_emb.transpose(1, 0), attention_mask=attention_mask)
+        return outputs
+
+
+model = BertModel().to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.00001)
 lr_scheduler = get_scheduler(
     name="linear",
     optimizer=optimizer,
@@ -80,57 +96,9 @@ lr_scheduler = get_scheduler(
 
 
 def train(input_ids, attention_mask, labels):
-    # tp = 0
-    # tn = 0
-    # fp = 0
-    # fn = 0
     input_ids = input_ids.transpose(1, 0)
     attention_mask = attention_mask.transpose(1, 0)
-    seq_emb = torch.zeros((seq_len, batch_size, 768)).to(device)
-    for i in range(seq_len):
-        emb = model.base_model.embeddings(input_ids[i])
-        seq_emb[i] = token_linear(emb.transpose(2,1)).squeeze(-1)
-        torch.cuda.empty_cache()
-        torch.cuda.empty_cache()
-        torch.cuda.empty_cache()
-        torch.cuda.empty_cache()
-        torch.cuda.empty_cache()
-    attention_mask = attention_mask.transpose(1, 0)
-    attention_mask, _ = torch.max(attention_mask, dim=-1)
-    outputs = model(inputs_embeds=seq_emb.transpose(1, 0), attention_mask=attention_mask,
-                    labels=labels.long())
-    # logits = outputs.logits
-    # yes_token_logits = logits[:, :, yes_token_id]
-    # no_token_logits = logits[:, :, no_token_id]
-    # results = torch.stack((no_token_logits, yes_token_logits), 2)
-    # y_softmax = nn.Softmax(dim=2)
-    # y_results = y_softmax(results)
-    # action_dist = torch.distributions.Categorical(y_results)
-    # action = action_dist.sample()
-    # action = action.unsqueeze(dim=2)
-    # probs_one = y_results.gather(2, action).squeeze()
-    # action = action.squeeze()
-    # p_mul = 0
-    # row_idxs, col_idxs = torch.where(labels != -100)
-    # row_idxs = row_idxs.tolist()
-    # col_idxs = col_idxs.tolist()
-    # for row_idx, col_idx in zip(row_idxs, col_idxs):
-    #     y_hat = bool(action[row_idx, col_idx])
-    #     p_mul = p_mul + torch.log(probs_one[row_idx, col_idx])
-    #     # p_mul=p_mul+torch.log(y_results[row_idx, col_idx,1])
-    #     y = bool(labels[row_idx, col_idx] == yes_token_id)
-    #     if y_hat and y:
-    #         tp += 1
-    #     elif not y_hat and not y:
-    #         tn += 1
-    #     elif y_hat and not y:
-    #         fp += 1
-    #     else:
-    #         fn += 1
-    # iou = tp / (tp + fn + fp) if tp + fn + fp != 0 else 0
-    # loss = -p_mul *iou
-    # loss = torch.tensor(1.0-iou)
-    # loss.requires_grad_(True)
+    outputs = model(input_ids, attention_mask, labels.long())
     loss = outputs.loss
     loss.backward()
     optimizer.step()
@@ -153,7 +121,7 @@ def load_json(path):
             line_type = data['line_type']
             for index, node_type in enumerate(line_type):
                 input_id[index] = node_type + ' ' + input_id[index]
-            fine_label = [no_token_id]*seq_len
+            fine_label = [no_token_id] * seq_len
             for label in data['vul_lines']:
                 if -1 < label < seq_len:
                     fine_label[label] = yes_token_id
@@ -272,18 +240,7 @@ def evaluate(input_ids, attention_mask, labels):
             label_num = [0] * batch_size
             batch_input_ids = batch_input_ids.transpose(1, 0)
             batch_attention_mask = batch_attention_mask.transpose(1, 0)
-            seq_emb = torch.zeros((seq_len, batch_size, 768)).to(device)
-            for j in range(seq_len):
-                emb = model.base_model.embeddings(batch_input_ids[j])
-                seq_emb[j] = token_linear(emb.transpose(2, 1)).squeeze(-1)
-                torch.cuda.empty_cache()
-                torch.cuda.empty_cache()
-                torch.cuda.empty_cache()
-                torch.cuda.empty_cache()
-                torch.cuda.empty_cache()
-            batch_attention_mask = batch_attention_mask.transpose(1, 0)
-            batch_attention_mask, _ = torch.max(batch_attention_mask, dim=-1)
-            outputs = model(inputs_embeds=seq_emb.transpose(1, 0), attention_mask=batch_attention_mask)
+            outputs = model(batch_input_ids, batch_attention_mask)
             logits = outputs.logits
             yes_token_logits = logits[:, :, yes_token_id]
             no_token_logits = logits[:, :, no_token_id]
@@ -336,11 +293,11 @@ def main():
     # test_data = load_pickle(os.path.join(data_dir, 'target', 'source_total_blocks_c.pkl'))
     # train_input_ids, train_attention_mask, train_labels = load_code(train_data, 600)
     # test_input_ids, test_attention_mask, test_labels = load_code(test_data, 1600)
-    # train_data = load_json(train_dir)
+    train_data = load_json(train_dir)
     eval_data = load_json(eval_dir)
-    # train_input_ids = train_data['input_ids']
-    # train_attention_mask = train_data['attention_mask']
-    # train_labels = train_data['fine_labels']
+    train_input_ids = train_data['input_ids']
+    train_attention_mask = train_data['attention_mask']
+    train_labels = train_data['fine_labels']
     test_input_ids = eval_data['input_ids']
     test_attention_mask = eval_data['attention_mask']
     test_labels = eval_data['fine_labels']
