@@ -1,14 +1,14 @@
 import json
 from torch import nn
 from tqdm import tqdm
-from transformers import AutoModelForMaskedLM, AutoTokenizer, get_scheduler
+from transformers import AutoModelForMaskedLM, AutoTokenizer, get_scheduler, get_linear_schedule_with_warmup
 import torch
 from early_stopping import EarlyStopping
 
 data_dir = 'C:\\Users\\wkr\\Desktop\\dong\\real'
-save_dir = 'D:\\dong\\model\\codebert_nodetype.pt'
-train_dir = 'D:/dong/data/vul_train.json'
-eval_dir = 'D:/dong/data/small_eval.json'
+save_dir = 'D:\\dong\\model\\codebert_base.pt'
+train_dir = 'D:/dong/data/train_data.json'
+eval_dir = 'D:/dong/data/eval_data.json'
 
 
 class PROMPTEmbedding(nn.Module):
@@ -41,6 +41,8 @@ seq_len = 50
 token_num = 25
 batch_size = 8
 n_tokens = 10
+
+
 # prompt_emb = PROMPTEmbedding(model.get_input_embeddings(),
 #                              n_tokens=n_tokens,
 #                              initialize_from_vocab=True)
@@ -62,13 +64,14 @@ class BertModel(nn.Module):
     def __init__(self):
         super(BertModel, self).__init__()
         self.model = AutoModelForMaskedLM.from_pretrained('D://dong//codebert-base').to(device)
-        # self.model = torch.load(save_dir).to(device)
+        # self.model = torch.load(save_dir).model.to(device)
+        self.base_model = self.model.base_model
         self.dense = nn.Linear(token_num, 1).to(device)
 
     def forward(self, input_ids, attention_mask, labels=None):
         seq_emb = torch.zeros((seq_len, batch_size, 768)).to(device)
         for i in range(seq_len):
-            emb = self.model.base_model.embeddings(input_ids[i])
+            emb = self.base_model.embeddings(input_ids[i])
             seq_emb[i] = self.dense(emb.transpose(2, 1)).squeeze(-1)
             torch.cuda.empty_cache()
             torch.cuda.empty_cache()
@@ -86,13 +89,14 @@ class BertModel(nn.Module):
 
 
 model = BertModel().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.00001)
-lr_scheduler = get_scheduler(
-    name="linear",
-    optimizer=optimizer,
-    num_warmup_steps=200,
-    num_training_steps=600 * 100 // batch_size
-)
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, eps=1e-8)
+# lr_scheduler = get_scheduler(
+#     name="linear",
+#     optimizer=optimizer,
+#     num_warmup_steps=200,
+#     num_training_steps=600 * 100 // batch_size
+# )
+lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=200, num_training_steps=10000)
 
 
 def train(input_ids, attention_mask, labels):
@@ -107,7 +111,7 @@ def train(input_ids, attention_mask, labels):
     return loss.item()
 
 
-def load_json(path):
+def load_json(path, stage='eval'):
     input_ids = []
     attention_mask = []
     fine_labels = []  # 细粒度
@@ -118,13 +122,20 @@ def load_json(path):
         dataset = json.loads(lines)
         for data in dataset:
             input_id = data['orig_code']
-            line_type = data['line_type']
-            for index, node_type in enumerate(line_type):
-                input_id[index] = node_type + ' ' + input_id[index]
+            # line_type = data['line_type']
+            # for index, node_type in enumerate(line_type):
+            #     input_id[index] = node_type + ' ' + input_id[index]
             fine_label = [no_token_id] * seq_len
             for label in data['vul_lines']:
                 if -1 < label < seq_len:
                     fine_label[label] = yes_token_id
+            # if stage == 'train':
+            #     if data['label'] == 1:
+            #         coarse = 'vulnerable.'
+            #     else:
+            #         coarse = 'non-vulnerable.'
+            #     input_id[min(len(input_id), seq_len) - 1] = 'The code is ' + coarse
+            #     fine_label[-1] = no_token_id
             coarse_label = torch.Tensor([data['label']])  # int
             input_encoding = tokenizer(input_id, padding=True, return_tensors="pt")
             input_embedding = input_encoding['input_ids']
@@ -221,14 +232,16 @@ def load_json(path):
 
 
 def evaluate(input_ids, attention_mask, labels):
-    tp = 0
-    tn = 0
-    fp = 0
-    fn = 0
+    tp = [0] * batch_size
+    tn = [0] * batch_size
+    fp = [0] * batch_size
+    fn = [0] * batch_size
     tp_b = 0
     tn_b = 0
     fp_b = 0
     fn_b = 0
+    iou = 0
+    vul_num = 0
     model.eval()
     with torch.no_grad():
         num = int(input_ids.size(0))
@@ -256,16 +269,16 @@ def evaluate(input_ids, attention_mask, labels):
                 y_hat = bool(action[row_idx, col_idx])
                 y = bool(batch_labels[row_idx, col_idx] == yes_token_id)
                 if y_hat and y:
-                    tp += 1
+                    tp[row_idx] += 1
                     y_num[row_idx] = 1
                     label_num[row_idx] = 1
                 elif not y_hat and not y:
-                    tn += 1
+                    tn[row_idx] += 1
                 elif y_hat and not y:
-                    fp += 1
+                    fp[row_idx] += 1
                     y_num[row_idx] = 1
                 else:
-                    fn += 1
+                    fn[row_idx] += 1
                     label_num[row_idx] = 1
             for j in range(batch_size):
                 if y_num[j] == 1 and label_num[j] == 1:
@@ -276,11 +289,17 @@ def evaluate(input_ids, attention_mask, labels):
                     fp_b += 1
                 else:
                     fn_b += 1
+            for index in range(batch_size):
+                if tn[index] + fp[index] != 0:
+                    iou_item = tp[index] / (tp[index] + fn[index] + fp[index]) if tp[index] + fn[index] + fp[
+                        index] != 0 else 0
+                    iou += iou_item
+                    vul_num += 1
         a = (tp_b + tn_b) / (tp_b + tn_b + fp_b + fn_b)
         p = tp_b / (tp_b + fp_b) if tp_b + fp_b != 0 else 0
         r = tp_b / (tp_b + fn_b) if tp_b + fn_b != 0 else 0
         f1 = 2 * p * r / (p + r) if p + r != 0 else 0
-        iou = tp / (tp + fn + fp) if tp + fn + fp != 0 else 0
+        iou = iou / vul_num
         print('粗粒度 ', tp_b, tn_b, fp_b, fn_b)
         print('细粒度 ', tp, tn, fp, fn)
         print(round(a, 4), round(p, 4), round(r, 4), round(f1, 4), round(iou, 4))
@@ -293,8 +312,8 @@ def main():
     # test_data = load_pickle(os.path.join(data_dir, 'target', 'source_total_blocks_c.pkl'))
     # train_input_ids, train_attention_mask, train_labels = load_code(train_data, 600)
     # test_input_ids, test_attention_mask, test_labels = load_code(test_data, 1600)
-    train_data = load_json(train_dir)
-    eval_data = load_json(eval_dir)
+    train_data = load_json(train_dir, 'train')
+    eval_data = load_json(eval_dir, 'eval')
     train_input_ids = train_data['input_ids']
     train_attention_mask = train_data['attention_mask']
     train_labels = train_data['fine_labels']
